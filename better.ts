@@ -2,6 +2,7 @@
 // flags and the read-only guard that runs inside the helper process. Nothing here spawns or talks to omp.
 import { realpathSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
+import type { CacheUsage } from "./cache.ts";
 
 const OPEN = "<improved-prompt>";
 const CLOSE = "</improved-prompt>";
@@ -41,9 +42,14 @@ export function helperPrompt(markdown: string): string {
 	return markdown.replace(/^\s*<!--[\s\S]*?-->\s*/, "").trim();
 }
 
-export function buildHelperTask(helper: string, prompt: string): string {
+/**
+ * The helper's task. `tools` names the tools that run when the helper is pinned to the chat's tool list, which
+ * advertises tools the guard refuses.
+ */
+export function buildHelperTask(helper: string, prompt: string, tools?: string[]): string {
 	return [
 		helper.trim(),
+		...(tools ? [`Only these tools work for you here, those of them you have: ${tools.join(", ")}. Every other tool is refused.`] : []),
 		`## Prompt to deepen\n\n${prompt || "None given: deepen the task in progress in the conversation so far, including any feedback I gave on work already done."}`,
 		returnSection,
 	].join("\n\n");
@@ -206,6 +212,8 @@ export interface HelperState {
 	lastTool?: string;
 	/** Whether the session header has arrived. */
 	started: boolean;
+	/** Token usage of the first assistant message, the one request that can read the chat's cache. */
+	usage?: CacheUsage;
 }
 
 export function newHelperState(): HelperState {
@@ -215,7 +223,7 @@ export function newHelperState(): HelperState {
 type ContentPart = { type?: string; text?: string };
 type HelperEvent = {
 	type?: string;
-	message?: { role?: string; content?: ContentPart[] | string; stopReason?: string; errorMessage?: string };
+	message?: { role?: string; content?: ContentPart[] | string; stopReason?: string; errorMessage?: string; usage?: { input?: unknown; cacheRead?: unknown; cacheWrite?: unknown } };
 	assistantMessageEvent?: { type?: string; delta?: string };
 	toolName?: string;
 	args?: Record<string, unknown>;
@@ -258,6 +266,10 @@ export function applyHelperEvent(state: HelperState, event: HelperEvent): void {
 			// --mode json can exit 0 after a failed model call, so the failure is read from the message.
 			const failed = message.stopReason === "error" || message.stopReason === "aborted";
 			state.modelError = failed ? message.errorMessage || `request ${message.stopReason}` : undefined;
+			const usage = message.usage;
+			if (!state.usage && usage && typeof usage.input === "number" && typeof usage.cacheRead === "number" && typeof usage.cacheWrite === "number") {
+				state.usage = { input: usage.input, cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite };
+			}
 			const parts = typeof message.content === "string" ? [{ type: "text", text: message.content }] : (message.content ?? []);
 			const text = parts.flatMap((part) => (part.type === "text" && part.text ? [part.text] : [])).join("\n");
 			if (text.trim()) {

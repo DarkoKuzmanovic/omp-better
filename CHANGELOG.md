@@ -3,6 +3,28 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.0] - 2026-11-13
+
+### Added
+
+- The helper reuses the chat's prompt cache on Anthropic (`anthropic`) and OpenAI Codex
+  (`openai-codex`). The chat remembers the head of its last request in memory (system prompt, tool
+  list; on Codex also the leading developer messages and the cache key); `/better` writes it to a
+  0600 `prefix.json` in the helper's private temp folder, and the helper sends it in place of its own.
+  On Codex the helper also gets `--prompt-cache-key` and `--provider-session-id` from the chat.
+  The helper still registers only the read tools and the guard is unchanged.
+- `OMP_BETTER_CACHE=off` turns reuse off. `OMP_BETTER_MODEL` or `OMP_BETTER_THINKING` also turn it
+  off for that run, since another model or level gets a request of its own.
+- The `better` session entry gets `cache`: whether reuse was on (or why not), and the input,
+  cache-read and cache-write tokens of the helper's first request. The terminal UI's completion
+  notice ends with a short "prompt cache: 23k of 23k tokens reused" when reuse was on.
+
+### Changed
+
+- With reuse on, the helper's task names the tools that work, because the model sees the chat's
+  full tool list. On Anthropic the helper loses `ast_grep` and `lsp` when the chat offers them only
+  behind `xd://`.
+
 ## [0.1.1] - 2026-11-13
 
 ### Fixed

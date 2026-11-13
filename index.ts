@@ -9,6 +9,7 @@ import {
 	buildHelperTask,
 	credentialInResult,
 	HELPER_ENV,
+	HELPER_TOOLS,
 	helperModelArgs,
 	helperPrompt,
 	helperToolBlock,
@@ -17,6 +18,7 @@ import {
 	progressLines,
 	withSecretExcludes,
 } from "./better.ts";
+import { type CachePlan, cacheOutcome, cachePlan, captureHead, PINNED_SUFFIX, PREFIX_ENV, parseHead, pinRequest, type RequestHead } from "./cache.ts";
 import { askHelper, Cancelled, sweepStaleTempDirs } from "./spawn.ts";
 
 const WIDGET = "better";
@@ -47,8 +49,40 @@ function guardHelper(pi: ExtensionAPI, marker: string): void {
 			isError: true,
 		};
 	});
+	pinToChat(pi);
 	// askHelper refuses to go on without this file, so a helper whose guard failed to load never acts.
 	writeFileSync(marker, String(process.pid));
+}
+
+/**
+ * Inside the helper: send the chat's request head (system prompt and tool list; on OpenAI Codex also its developer
+ * messages and cache key) instead of the helper's own, so the provider reads the chat's prompt cache. The wire then
+ * lists the chat's tools, but only the read tools are registered here and the guard above still refuses the rest.
+ */
+function pinToChat(pi: ExtensionAPI): void {
+	const path = process.env[PREFIX_ENV];
+	if (!path) return;
+	let head: RequestHead | undefined;
+	try {
+		head = parseHead(readFileSync(path, "utf8"));
+	} catch {
+		return;
+	}
+	if (!head) return;
+	const chatHead = head;
+	let reported = false;
+	pi.on("before_provider_request", (event, ctx) => {
+		if (ctx.agent?.kind === "sub") return undefined;
+		const pinned = pinRequest(event.payload, ctx.model, chatHead);
+		if (pinned && !reported) {
+			reported = true;
+			// Tells askHelper that reuse was on; the file goes with the temp folder.
+			try {
+				writeFileSync(`${path}${PINNED_SUFFIX}`, "");
+			} catch {}
+		}
+		return pinned;
+	});
 }
 
 function failed(ctx: ExtensionContext, error: unknown): void {
@@ -64,11 +98,22 @@ export default function (pi: ExtensionAPI) {
 	const extensionPath = fileURLToPath(import.meta.url);
 	const helperText = () => helperPrompt(readFileSync(new URL("./helper.md", import.meta.url), "utf8"));
 	let helperRun: AbortController | undefined;
+	// The head of the chat's last main-agent request, kept in memory for /better to pin the helper to.
+	let lastRequest: RequestHead | undefined;
 	// Where omp keeps markers for sessions stored outside its sessions folder, such as the helper's fork.
 	const agentDir = typeof pi.pi?.getAgentDir === "function" ? pi.pi.getAgentDir() : undefined;
 	sweepStaleTempDirs(tmpdir(), agentDir);
 
+	// Passive: remembers the request and returns nothing, so the chat's request is sent unchanged.
+	pi.on("before_provider_request", (event, ctx) => {
+		if (ctx.agent?.kind !== "main") return undefined;
+		lastRequest = captureHead(event.payload, ctx.model, lastRequest) ?? lastRequest;
+		return undefined;
+	});
+
 	const stopRun = (_event: unknown, ctx: ExtensionContext) => {
+		// The next session has a cache key of its own.
+		lastRequest = undefined;
 		if (!helperRun) return;
 		// After this the old session is gone, so the cancelled run must not touch its ctx (see the SHUTDOWN checks).
 		helperRun.abort(SHUTDOWN);
@@ -93,12 +138,16 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			let modelArgs: string[];
+			let plan: CachePlan;
 			try {
 				const chatModel = ctx.model && `${ctx.model.provider}/${ctx.model.id}`;
 				modelArgs = helperModelArgs({ model: process.env.OMP_BETTER_MODEL, thinking: process.env.OMP_BETTER_THINKING }, chatModel, pi.getThinkingLevel());
+				const overridden = Boolean(process.env.OMP_BETTER_MODEL?.trim() || process.env.OMP_BETTER_THINKING?.trim());
+				plan = cachePlan({ setting: process.env.OMP_BETTER_CACHE, overridden, head: lastRequest, chatModel: ctx.model });
 			} catch (error) {
 				return failed(ctx, error);
 			}
+			const head = "head" in plan ? plan.head : undefined;
 
 			const run = new AbortController();
 			helperRun = run;
@@ -118,32 +167,37 @@ export default function (pi: ExtensionAPI) {
 
 			const finished = (async () => {
 				try {
-					const reply = await askHelper({
+					const result = await askHelper({
 						cwd: ctx.cwd,
 						sessionFile: fork,
 						modelArgs,
-						task: buildHelperTask(helperText(), prompt),
+						task: buildHelperTask(helperText(), prompt, head ? HELPER_TOOLS : undefined),
 						signal: run.signal,
 						extensionPath,
 						agentDir,
+						head,
+						chatSessionId: ctx.sessionManager.getSessionId(),
 						onProgress: (state) => {
 							progress = state;
 							showProgress();
 						},
 					});
 					if (run.signal.aborted) throw new Cancelled("cancelled");
+					const { reply, usage, pinned } = result;
+					const skipped = "skipped" in plan ? plan.skipped : pinned ? undefined : "the helper's request didn't match the chat's model or shape";
+					const cache = { pinned, ...usage, ...(skipped ? { skipped } : {}) };
 					let improved: string;
 					try {
 						improved = parseMarkedPrompt(reply);
 					} catch (error) {
 						// Keep the reply, so the user can see what the helper said instead of the marked prompt.
-						pi.appendEntry(ENTRY, { prompt, reply });
+						pi.appendEntry(ENTRY, { prompt, reply, cache });
 						const file = join(tmpdir(), `omp-better-reply-${Date.now()}.md`);
 						writeFileSync(file, reply);
 						throw new Error(`${(error as Error).message} The helper's whole reply is in ${file}`);
 					}
-					pi.appendEntry(ENTRY, { prompt, improved, reply });
-					handOver(pi, ctx, improved);
+					pi.appendEntry(ENTRY, { prompt, improved, reply, cache });
+					handOver(pi, ctx, improved, pinned && usage ? cacheOutcome(usage) : undefined);
 				} catch (error) {
 					if (run.signal.reason === SHUTDOWN) return;
 					if (error instanceof Cancelled) ctx.ui.notify("/better cancelled; nothing was sent", "info");
@@ -171,8 +225,11 @@ export default function (pi: ExtensionAPI) {
 	});
 }
 
-/** The TUI gets the prompt in its input box; elsewhere there's no box to read back, so it's posted as a message. */
-function handOver(pi: ExtensionAPI, ctx: ExtensionContext, prompt: string): void {
+/**
+ * The TUI gets the prompt in its input box; elsewhere there's no box to read back, so it's posted as a message.
+ * `cacheNote` (how much of the chat's prompt cache the helper reused) goes into the TUI's notice.
+ */
+function handOver(pi: ExtensionAPI, ctx: ExtensionContext, prompt: string, cacheNote?: string): void {
 	if (ctx.mode !== "tui") {
 		// Never "steer" (the default while the agent works): that would feed the prompt to the running turn.
 		pi.sendMessage({ customType: ENTRY, content: prompt, display: true }, ctx.isIdle() ? undefined : { deliverAs: "nextTurn" });
@@ -180,5 +237,5 @@ function handOver(pi: ExtensionAPI, ctx: ExtensionContext, prompt: string): void
 	}
 	const draft = ctx.ui.getEditorText().trim();
 	ctx.ui.setEditorText(draft ? `${prompt}\n\n${draft}` : prompt);
-	ctx.ui.notify(`The improved prompt is in your input box${draft ? ", above the draft you'd typed" : ""}. Edit it, then press Enter to send.`, "info");
+	ctx.ui.notify(`The improved prompt is in your input box${draft ? ", above the draft you'd typed" : ""}. Edit it, then press Enter to send.${cacheNote ? ` (${cacheNote})` : ""}`, "info");
 }

@@ -47,12 +47,14 @@ When it finishes:
 - **Terminal UI.** The improved prompt goes into your input box, above anything you typed meanwhile.
 - **RPC, print and JSON modes.** There is no input box to read back, so the improved prompt is posted as a `better` custom message. That starts no turn, and while the agent is busy it waits for the next turn. In print and JSON mode the command waits for the helper to finish.
 
-The helper's whole reply, with the four answers, is saved as a `better` session entry.
+The helper's whole reply, with the four answers, is saved as a `better` session entry, along with the prompt-cache result of its first request (see [Prompt cache](#prompt-cache)).
 
 The helper uses the chat's model and thinking level. To pin either one, set these in the environment omp starts with:
 
 - `OMP_BETTER_MODEL`: anything `omp --model` accepts, such as `anthropic/claude-sonnet-5-5` or `@smol`. The helper runs without your other extensions, so a model that only an extension provides won't work.
 - `OMP_BETTER_THINKING`: one of `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `auto`.
+
+Setting either one gives the helper a request of its own, so it can't reuse the chat's prompt cache. `OMP_BETTER_CACHE=off` turns cache reuse off; `on`, the default, leaves it on.
 
 ## Read-only: what is and is not guaranteed
 
@@ -71,6 +73,8 @@ Enforced:
 
 `bun test` covers these rules, and `tests/fixtures/guard-refusals.jsonl` is a captured omp 18.20.0 helper run in which `write`, `bash`, `eval`, `task` and `edit` calls were all refused.
 
+When the helper reuses the chat's prompt cache, the model sees the chat's tool list, `bash` and `edit` included, but the helper process still registers only the read tools and the guard is unchanged. In live runs on both Anthropic and OpenAI Codex, `bash` and `edit` calls came back `Tool … not found`, and `write` (to a path or to `xd://bash`) was refused by the guard. No file changed.
+
 Not guaranteed:
 
 - **This is not a sandbox.** The allowed tools are trusted to be read-only. `read` fetches URLs over the network, `web_search` sends queries to a search provider, and `lsp` starts language servers, which can run project code (rust-analyzer runs `build.rs` and proc macros, for example).
@@ -84,20 +88,43 @@ Not guaranteed:
 ```
 omp --mode json -p [--profile <yours>] (--fork <copy> --session-dir <temp>/sessions | --no-session)
     --no-extensions -e <this index.ts> --tools read,grep,glob,find,ast_grep,lsp,web_search
-    --no-title --max-time 20m --model <model> [--thinking <level>] <task>
+    --no-title --max-time 20m [--prompt-cache-key <key> --provider-session-id <id>]
+    --model <model> [--thinking <level>] <task>
 ```
 
 - The helper runs in the chat's working directory with `OMP_BETTER_HELPER` set, which makes `index.ts` act as the guard there.
-- The task is `helper.md`, then your prompt, then a request to end with the rewrite between `<improved-prompt>` and `</improved-prompt>` lines.
+- The task is `helper.md`, then your prompt, then a request to end with the rewrite between `<improved-prompt>` and `</improved-prompt>` lines. When the cache is reused, a line naming the tools that work comes after `helper.md`.
 - If the session is saved, its file is copied into a private temp folder, cut at the last complete line, and the helper forks that copy. Your session file is only read. Nothing else is copied, so `artifact://` links from the chat may not resolve for the helper, and messages you send after starting `/better` don't reach it.
+- To reuse the cache, the chat's request head goes into `prefix.json` in the same temp folder (mode 0600), and `OMP_BETTER_PREFIX` points the helper at it. On OpenAI Codex the chat's prompt-cache key and session id are passed too.
 - The temp folder is deleted when the helper ends and when omp exits. If omp was killed, the next omp that loads the extension deletes it.
+
+## Prompt cache
+
+A `/better` on a long chat would pay again for the whole history, because the helper is a separate process with its own system prompt and tool list. To avoid that, the chat remembers the head of its last request in memory: the system prompt and tool list, and on OpenAI Codex also the leading developer messages and the cache key. The helper sends that head instead of its own, so the provider finds the chat's prefix in its cache. The head is written only to the private temp folder above, never to the session or a log.
+
+Measured on omp 18.20.0 with the first helper request ("Reply with ok2") right after a parent chat turn. The parent loaded a test extension that adds a tool and system-prompt lines, so a plain helper's request differs from it, as a terminal chat's does. Tokens are input / cache read / cache write:
+
+| Provider, model | Chat's last request | Helper without reuse (0.1.1) | Helper with reuse |
+|---|---|---|---|
+| `anthropic`, claude-sonnet-5-5 | 2 / 23,285 / 133 | 2,237 / 8,735 / 6,137 | 4 / 23,418 / 17 |
+| `openai-codex`, gpt-6.1-terra | 214 / 13,696 / 0 | 10,314 / 0 / 0 | 361 / 13,568 / 0 |
+
+The 8,735 tokens the 0.1.1 helper read are its own prefix, cached by earlier helper runs. A real `/better` in the terminal UI on Anthropic read 28,329 of the chat's 28,331 tokens; one over RPC on OpenAI Codex read 13,312 of 13,448.
+
+Limits:
+
+- Supported: Anthropic Messages (`anthropic`) and OpenAI Codex Responses (`openai-codex`). Other providers, including `openai`, run as in 0.1.1.
+- Reuse needs the chat's model, an earlier request in this session, and a warm cache. Anthropic keeps it 5 minutes or an hour, as omp asks (these runs got an hour); OpenAI decides on its own.
+- OpenAI Codex caching is best effort, for the chat too: in 12 of 12 runs the helper read the chat's cache, but without the chat's session id it did in only 6 of 9.
+- On Anthropic the helper loses `ast_grep` and `lsp` when the chat offers them only behind `xd://`: listing them changed the cached prefix (the helper then read 10.9k of 23.4k tokens).
+- Anything the chat changed only in memory (another extension's `context` hook, pruned tool output) can still make the forked history differ.
 
 ## Differences from pi-better
 
 | | pi-better | omp-better |
 |---|---|---|
 | Read-only | The helper keeps the shell; only the prompt stops a shell command from writing | No shell. Non-read tools and credential paths are refused; the guard fails closed |
-| Extensions and tools | Loads your extensions and keeps the chat's tool list, to reuse the prompt cache | Loads only itself, with its own tool list; no attempt to reuse the cache |
+| Extensions and tools | Loads your extensions and keeps the chat's tool list, to reuse the prompt cache | Loads only itself, with only the read tools, and sends the chat's system prompt and tool list to reuse the prompt cache (Anthropic, OpenAI Codex) |
 | Copy of the chat | `--fork` of the live session file | `--fork` of a temp copy |
 | Model setting | `"better"` in `settings.json` | Environment variables |
 | Cancel and progress | Esc or `/better-cancel`; a six-cell meter | `/better-cancel`; a two-line text widget |
@@ -115,11 +142,12 @@ A failed run reports `/better failed: <reason>`: as an error notice in the termi
 
 ## Files and tests
 
-- `index.ts`: the extension (commands, progress widget, hand-over). In the helper process it is the read-only guard.
+- `index.ts`: the extension (commands, progress widget, hand-over, remembering the chat's last request). In the helper process it is the read-only guard and swaps in the chat's request head.
 - `better.ts`: the pure parts (task text, reply parser, tool and credential guard, progress, error wording, model flags).
+- `cache.ts`: the pure parts of cache reuse (which request fields to keep, the prefix file, the swap).
 - `spawn.ts`: starts, watches, stops and cleans up the helper process.
 - `helper.md`: the prompt. It is pi-better's text with one path changed to omp's, under an attribution comment that is stripped before sending.
-- `tests/`: two suites, a fake `omp` and two captured `omp --mode json` event streams. `bun test` in the repo folder runs them; it needs no omp install and no login.
+- `tests/`: four suites, a fake `omp` and two captured `omp --mode json` event streams. `bun test` in the repo folder runs them; it needs no omp install and no login.
 
 ## Licence and attribution
 

@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import type { Readable } from "node:stream";
 import { applyHelperEvent, HELPER_ENV, HELPER_TIMEOUT_MS, HELPER_TOOLS, type HelperState, helperExitError, newHelperState, parseEventLine } from "./better.ts";
+import { type CacheUsage, helperCacheArgs, PINNED_SUFFIX, PREFIX_ENV, type RequestHead, serializeHead } from "./cache.ts";
 
 export class Cancelled extends Error {}
 
@@ -33,6 +34,19 @@ export interface HelperOptions {
 	agentDir?: string;
 	/** The arguments omp itself was started with, to pass --profile on. */
 	argv?: string[];
+	/** The chat's last request head; when given, the helper pins its requests to it to reuse the chat's prompt cache. */
+	head?: RequestHead;
+	/** The chat's session id, passed on as the provider session id where that helps reuse (OpenAI Codex). */
+	chatSessionId?: string;
+}
+
+export interface HelperResult {
+	/** Text of the helper's last reply. */
+	reply: string;
+	/** Token usage of the helper's first request. */
+	usage?: CacheUsage;
+	/** Whether the helper swapped the chat's request head into its requests. */
+	pinned: boolean;
 }
 
 /** The omp running this extension: a compiled omp is its own executable; from source it is bun plus the CLI script. */
@@ -106,7 +120,7 @@ function copySession(source: string, target: string): void {
 	else writeFileSync(target, data.subarray(0, end + 1));
 }
 
-export function helperArgs(options: { sourceCopy?: string; sessionDir: string; extensionPath: string; modelArgs: string[]; task: string; profile?: string[] }): string[] {
+export function helperArgs(options: { sourceCopy?: string; sessionDir: string; extensionPath: string; modelArgs: string[]; task: string; profile?: string[]; cacheArgs?: string[] }): string[] {
 	return [
 		"--mode", "json", "-p",
 		...(options.profile ?? []),
@@ -116,13 +130,14 @@ export function helperArgs(options: { sourceCopy?: string; sessionDir: string; e
 		"--tools", HELPER_TOOLS.join(","),
 		"--no-title",
 		"--max-time", `${Math.ceil(HELPER_TIMEOUT_MS / 60_000)}m`,
+		...(options.cacheArgs ?? []),
 		...options.modelArgs,
 		options.task,
 	];
 }
 
-/** Runs the helper and resolves with the text of its last reply. Rejects with Cancelled when the signal aborts. */
-export function askHelper(options: HelperOptions): Promise<string> {
+/** Runs the helper and resolves with its last reply. Rejects with Cancelled when the signal aborts. */
+export function askHelper(options: HelperOptions): Promise<HelperResult> {
 	const timeoutMs = options.timeoutMs ?? HELPER_TIMEOUT_MS;
 	const temp = mkdtempSync(join(tmpdir(), `${TEMP_PREFIX}${process.pid}-`));
 	const cleanUp = () => {
@@ -131,6 +146,7 @@ export function askHelper(options: HelperOptions): Promise<string> {
 	};
 	let child: ChildProcessByStdio<null, Readable, Readable>;
 	const marker = join(temp, "guard-ready");
+	const prefix = join(temp, "prefix.json");
 	try {
 		let sourceCopy: string | undefined;
 		if (options.sessionFile) {
@@ -140,15 +156,22 @@ export function askHelper(options: HelperOptions): Promise<string> {
 		}
 		const env: NodeJS.ProcessEnv = { ...process.env, [HELPER_ENV]: marker, PI_NO_TITLE: "1" };
 		for (const key of TERMINAL_ID_ENV) delete env[key];
-		const [command, ...prefix] = options.command ?? ompCommand();
-		const args = helperArgs({ sourceCopy, sessionDir: join(temp, "sessions"), extensionPath: options.extensionPath, modelArgs: options.modelArgs, task: options.task, profile: profileArgs(options.argv ?? process.argv) });
-		child = spawn(command, [...prefix, ...args], { cwd: options.cwd, stdio: ["ignore", "pipe", "pipe"], env });
+		delete env[PREFIX_ENV];
+		// The chat's system prompt and tool list: private to this folder (0700), and removed with it.
+		if (options.head) {
+			env[PREFIX_ENV] = prefix;
+			writeFileSync(prefix, serializeHead(options.head), { mode: 0o600 });
+		}
+		const [command, ...prefixArgs] = options.command ?? ompCommand();
+		const cacheArgs = helperCacheArgs(options.head, options.chatSessionId);
+		const args = helperArgs({ sourceCopy, sessionDir: join(temp, "sessions"), extensionPath: options.extensionPath, modelArgs: options.modelArgs, task: options.task, profile: profileArgs(options.argv ?? process.argv), cacheArgs });
+		child = spawn(command, [...prefixArgs, ...args], { cwd: options.cwd, stdio: ["ignore", "pipe", "pipe"], env });
 	} catch (error) {
 		cleanUp();
 		return Promise.reject(error);
 	}
 
-	const { promise, resolve: resolvePromise, reject } = Promise.withResolvers<string>();
+	const { promise, resolve: resolvePromise, reject } = Promise.withResolvers<HelperResult>();
 	const state = newHelperState();
 	let stderr = "";
 	let buffered = "";
@@ -212,9 +235,10 @@ export function askHelper(options: HelperOptions): Promise<string> {
 		clearTimeout(killTimer);
 		options.signal.removeEventListener("abort", onAbort);
 		process.removeListener("exit", onExit);
+		const pinned = existsSync(`${prefix}${PINNED_SUFFIX}`);
 		cleanUp();
 		if (error) reject(error);
-		else resolvePromise(state.reply);
+		else resolvePromise({ reply: state.reply, usage: state.usage, pinned });
 	};
 	child.on("error", (error) => settle(new Error(`Couldn't start omp for the helper: ${error.message}`)));
 	child.on("close", (code, exitSignal) => {

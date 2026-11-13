@@ -3,20 +3,35 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HELPER_TOOLS, parseMarkedPrompt } from "../better.ts";
+import { parseHead, type RequestHead } from "../cache.ts";
 import { askHelper, Cancelled, helperArgs, profileArgs, sweepStaleTempDirs } from "../spawn.ts";
 
 const fake = ["bun", new URL("./fake-omp.ts", import.meta.url).pathname];
 const fixtures = new URL("./fixtures/", import.meta.url).pathname;
 const ours = () => readdirSync(tmpdir()).filter((name) => name.startsWith(`omp-better-${process.pid}-`));
-const FAKE_KEYS = ["FAKE_OMP_FIXTURE", "FAKE_OMP_GUARD", "FAKE_OMP_EXIT", "FAKE_OMP_STDERR", "FAKE_OMP_SIGNAL", "FAKE_OMP_HANG", "FAKE_OMP_REPORT", "FAKE_OMP_AGENT_DIR"];
+const FAKE_KEYS = ["FAKE_OMP_FIXTURE", "FAKE_OMP_GUARD", "FAKE_OMP_EXIT", "FAKE_OMP_STDERR", "FAKE_OMP_SIGNAL", "FAKE_OMP_HANG", "FAKE_OMP_REPORT", "FAKE_OMP_AGENT_DIR", "FAKE_OMP_PIN"];
+const codexHead: RequestHead = {
+	model: { provider: "openai-codex", id: "gpt-x", api: "openai-codex-responses" },
+	fields: { instructions: "SYSTEM", tools: [{ type: "function", name: "bash" }], prompt_cache_key: "chat-key", developer: [] },
+};
 
 function setFake(values: Record<string, string>): void {
 	for (const key of FAKE_KEYS) delete process.env[key];
 	Object.assign(process.env, values);
 }
 
-function run(signal = new AbortController().signal, extra: { sessionFile?: string; timeoutMs?: number; agentDir?: string; argv?: string[] } = {}) {
+function run(signal = new AbortController().signal, extra: { sessionFile?: string; timeoutMs?: number; agentDir?: string; argv?: string[]; head?: RequestHead; chatSessionId?: string } = {}) {
 	return askHelper({ cwd: tmpdir(), modelArgs: ["--model", "test/model"], task: "TASK", signal, extensionPath: "/ext/index.ts", command: fake, ...extra });
+}
+
+/** Runs `body` with a fresh folder for reports, removed afterwards. */
+async function withDir(body: (dir: string) => Promise<void>): Promise<void> {
+	const dir = mkdtempSync(join(tmpdir(), "omp-better-test-"));
+	try {
+		await body(dir);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
 }
 
 afterEach(() => {
@@ -46,13 +61,72 @@ describe("helperArgs", () => {
 		expect(profileArgs(["omp", "--no-session"])).toEqual([]);
 		expect(helperArgs({ sessionDir: "/t", extensionPath: "/e.ts", modelArgs: [], task: "T", profile: ["--profile", "work"] }).slice(0, 5)).toEqual(["--mode", "json", "-p", "--profile", "work"]);
 	});
+
+	test("puts the cache flags before the model flags, and keeps the restricted tool list and the guard", () => {
+		const cacheArgs = ["--prompt-cache-key", "chat-key", "--provider-session-id", "chat-id"];
+		const args = helperArgs({ sourceCopy: "/t/s.jsonl", sessionDir: "/t/sessions", extensionPath: "/e.ts", modelArgs: ["--model", "a/b"], task: "T", cacheArgs });
+		expect(args.slice(args.indexOf("--prompt-cache-key"), args.indexOf("--prompt-cache-key") + 6)).toEqual([...cacheArgs, "--model", "a/b"]);
+		expect(args).toContain("--no-extensions");
+		expect(args[args.indexOf("--tools") + 1]).toBe(HELPER_TOOLS.join(","));
+		expect(helperArgs({ sessionDir: "/t", extensionPath: "/e.ts", modelArgs: [], task: "T" })).not.toContain("--prompt-cache-key");
+	});
 });
 
 describe("askHelper", () => {
-	test("returns the last reply of a captured helper run and cleans up", async () => {
+	test("returns the last reply and the first request's usage of a captured helper run, and cleans up", async () => {
 		setFake({ FAKE_OMP_FIXTURE: join(fixtures, "helper-run.jsonl") });
-		const reply = await run();
-		expect(parseMarkedPrompt(reply)).toContain("src/cli.ts");
+		const result = await run();
+		expect(parseMarkedPrompt(result.reply)).toContain("src/cli.ts");
+		expect(result.usage).toEqual({ input: 4, cacheRead: 0, cacheWrite: 17873 });
+		expect(result.pinned).toBe(false);
+	});
+
+	test("hands a pinned helper the chat's request head in a private file and its cache key, then removes the file", async () => {
+		await withDir(async (dir) => {
+			const report = join(dir, "report.json");
+			setFake({ FAKE_OMP_FIXTURE: join(fixtures, "helper-run.jsonl"), FAKE_OMP_REPORT: report, FAKE_OMP_PIN: "1" });
+			const result = await run(undefined, { head: codexHead, chatSessionId: "chat-id" });
+			const seen = JSON.parse(readFileSync(report, "utf8"));
+			expect(seen.prefix).toMatch(new RegExp(`/omp-better-${process.pid}-[^/]+/prefix\\.json$`));
+			expect(seen.prefixMode).toBe(0o600);
+			expect(parseHead(seen.prefixContent)).toEqual(codexHead);
+			expect(seen.args[seen.args.indexOf("--prompt-cache-key") + 1]).toBe("chat-key");
+			expect(seen.args[seen.args.indexOf("--provider-session-id") + 1]).toBe("chat-id");
+			expect(result.pinned).toBe(true);
+			expect(existsSync(seen.prefix)).toBe(false);
+		});
+	});
+
+	test("without a head the helper gets no prefix and no cache key, even if omp's environment had one", async () => {
+		await withDir(async (dir) => {
+			const report = join(dir, "report.json");
+			process.env.OMP_BETTER_PREFIX = "/somewhere/prefix.json";
+			try {
+				setFake({ FAKE_OMP_FIXTURE: join(fixtures, "helper-run.jsonl"), FAKE_OMP_REPORT: report, FAKE_OMP_PIN: "1" });
+				const result = await run();
+				const seen = JSON.parse(readFileSync(report, "utf8"));
+				expect(seen.envKeys).not.toContain("OMP_BETTER_PREFIX");
+				expect(seen.args).not.toContain("--prompt-cache-key");
+				expect(result.pinned).toBe(false);
+			} finally {
+				delete process.env.OMP_BETTER_PREFIX;
+			}
+		});
+	});
+
+	test("an Anthropic head has no cache key to pass", async () => {
+		await withDir(async (dir) => {
+			const report = join(dir, "report.json");
+			setFake({ FAKE_OMP_FIXTURE: join(fixtures, "helper-run.jsonl"), FAKE_OMP_REPORT: report });
+			const head: RequestHead = { model: { provider: "anthropic", id: "c", api: "anthropic-messages" }, fields: { system: [{ type: "text", text: "S" }], tools: [{ name: "read" }] } };
+			const result = await run(undefined, { head, chatSessionId: "chat-id" });
+			const seen = JSON.parse(readFileSync(report, "utf8"));
+			expect(parseHead(seen.prefixContent)).toEqual(head);
+			expect(seen.args).not.toContain("--prompt-cache-key");
+			expect(seen.args).not.toContain("--provider-session-id");
+			// The fake didn't pin, like a helper whose model or request shape didn't match.
+			expect(result.pinned).toBe(false);
+		});
 	});
 
 	test("hands the helper a copy of the session cut at its last complete line, passes --profile on, withholds the terminal id and removes omp's marker for the fork", async () => {
@@ -115,19 +189,21 @@ describe("askHelper", () => {
 		await expect(run()).rejects.toThrow("The helper finished without replying; run /better again");
 	});
 
-	test("abort kills the helper, removes the temp folder and rejects with Cancelled", async () => {
+	test("abort kills a pinned helper, removes the temp folder with the prefix and rejects with Cancelled", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "omp-better-test-"));
 		try {
 			const report = join(dir, "report.json");
 			setFake({ FAKE_OMP_FIXTURE: join(fixtures, "helper-run.jsonl"), FAKE_OMP_HANG: "1", FAKE_OMP_REPORT: report });
 			const controller = new AbortController();
-			const pending = run(controller.signal);
+			const pending = run(controller.signal, { head: codexHead });
 			// A real child process writes this file; poll for it rather than guess how long its start takes.
 			while (!existsSync(report)) await Bun.sleep(20);
-			const { pid } = JSON.parse(readFileSync(report, "utf8"));
+			const { pid, prefix } = JSON.parse(readFileSync(report, "utf8"));
+			expect(existsSync(prefix)).toBe(true);
 			controller.abort();
 			await expect(pending).rejects.toBeInstanceOf(Cancelled);
 			expect(() => process.kill(pid, 0)).toThrow();
+			expect(existsSync(prefix)).toBe(false);
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
@@ -136,7 +212,7 @@ describe("askHelper", () => {
 	test("a helper over its time limit is stopped", async () => {
 		setFake({ FAKE_OMP_FIXTURE: join(fixtures, "helper-run.jsonl"), FAKE_OMP_HANG: "1" });
 		// The limit is a real timer racing a real (hanging) child process, so fake timers can't drive it.
-		await expect(run(undefined, { timeoutMs: 400 })).rejects.toThrow(/The helper timed out after/);
+		await expect(run(undefined, { timeoutMs: 400, head: codexHead })).rejects.toThrow(/The helper timed out after/);
 	});
 
 	test("a command that can't start is reported", async () => {

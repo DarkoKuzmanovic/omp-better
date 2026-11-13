@@ -164,6 +164,8 @@ describe("pathRefusal", () => {
 			"auth.json", "~/.pi/agent/auth.json", "~/.hermes/auth-tokens.json", "~/.ssh", "~/.ssh/id_ed25519", "/srv/keys/id_rsa",
 			"~/.aws/credentials", "~/.config/gcloud/credentials.db", "~/.config/gh/x/credentials", "~/.netrc", "~/.git-credentials",
 			"~/.omp/agent/models.yml", "~/.omp/agent/mcp.json", "~/.omp/agent/secrets/key",
+			"~/.omp/profiles/work/agent/agent.db", "~/.omp/profiles/work/agent/agent.db-wal", "~/.omp/profiles/work/agent/models.yml",
+			"~/.omp/profiles/work/agent/mcp.json", "~/.omp/profiles/work/agent/secrets/key", "/home/tester/.omp/profiles/p2/agent/secrets",
 		]) {
 			expect(pathRefusal(path, scope)).toMatch(/looks like a credential file/);
 		}

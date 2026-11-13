@@ -65,7 +65,7 @@ Enforced:
 - **Fails closed.** The guard writes a marker file when it loads. If the helper's session starts and the marker is missing, the helper is stopped at once and `/better` fails. The helper is never given `--auto-approve`.
 - **Credential paths.** The `path` argument of `read`, `grep`, `glob`, `find` and `ast_grep` and the `file` argument of `lsp` are checked as given and again after resolving symlinks, including `;`-separated lists, `:selectors`, archive members and `file://` URLs. Refused:
   - any path component named `.env*`, `auth*.json`, `.netrc`, `.git-credentials`, `.pgpass`, `.npmrc`, `.pypirc`, `id_rsa*`, `id_dsa*`, `id_ecdsa*` or `id_ed25519*`;
-  - under your home directory: `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.password-store`, `~/.docker`, `~/.kube`, `~/.omp/agent/secrets`, `~/.omp/agent/agent.db*`, `~/.omp/agent/models.yml`, `~/.omp/agent/mcp.json` and `~/.config/**/credentials*`;
+  - under your home directory: `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.password-store`, `~/.docker`, `~/.kube`, `~/.omp/agent/secrets`, `~/.omp/agent/agent.db*`, `~/.omp/agent/models.yml`, `~/.omp/agent/mcp.json` and `~/.config/**/credentials*`. The same `~/.omp/agent/…` files under `~/.omp/profiles/<name>/agent/` are refused too;
   - URLs with a scheme other than `http(s)`, `file`, `skill`, `omp`, `rule`, `artifact`, `local`, `memory`, `history`, `agent`, `issue` and `pr`. That rules out `ssh://`, `vault://`, `proc://`, `mcp://` and `xd://`.
 - **Searches.** `grep` gets exclusions such as `!**/.env*` and `!**/.ssh` added to its path. If a `grep`, `find` or `ast_grep` result still names a credential file, the whole result is withheld from the model.
 
@@ -76,7 +76,6 @@ Not guaranteed:
 - **This is not a sandbox.** The allowed tools are trusted to be read-only. `read` fetches URLs over the network, `web_search` sends queries to a search provider, and `lsp` starts language servers, which can run project code (rust-analyzer runs `build.rs` and proc macros, for example).
 - **Everything the helper reads goes to the model provider**, as in any chat.
 - **The credential guard works on names and paths, not contents.** A key hard-coded in `config.ts` or `settings.json` is readable. The guard also blocks some harmless files, such as `.env.example` and `authors.json`.
-- **The `~/.omp/agent/…` rules are literal paths.** With `--profile <name>` omp keeps that data in `~/.omp/profiles/<name>/agent/`, where only the name rules and the `grep` exclusions apply.
 - **MCP servers are not switched off in the helper.** Only their tools are refused.
 - **A killed omp leaves its helper running.** After a SIGKILL of omp, the helper goes on until its own `--max-time 20m`.
 

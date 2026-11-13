@@ -3,6 +3,20 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.1] - 2026-11-13
+
+### Fixed
+
+- With `omp --profile <name>`, the credential guard did not protect that profile's `agent.db*`,
+  `models.yml`, `mcp.json` and `secrets/` under `~/.omp/profiles/<name>/agent/`; only the default
+  `~/.omp/agent/` paths were refused. Both locations are now refused.
+
+### Changed
+
+- README rewritten and shortened, and corrected where it disagreed with the code: not every failure
+  carries the `/better failed:` prefix, the reply file for a failed parse is not cleaned up,
+  and pi-better refuses non-read tools too (only its shell relies on the prompt).
+
 ## [0.1.0] - 2026-11-13
 
 First release: a port of pi-better v0.2.0 (commit `509967c`) to omp 18.20.0.

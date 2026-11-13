@@ -95,8 +95,10 @@ function secretInPath(absolute: string, home: string): string | undefined {
 	if (named) return named;
 	const fromHome = relative(home, absolute);
 	if (fromHome.startsWith("..") || isAbsolute(fromHome)) return undefined;
-	if (HOME_SECRET_DIRS.some((dir) => fromHome === dir || fromHome.startsWith(`${dir}/`))) return `~/${fromHome}`;
-	if (HOME_SECRET_FILES.some((file) => file.test(fromHome))) return `~/${fromHome}`;
+	// omp --profile <name> keeps the same files under ~/.omp/profiles/<name>/, so check them as ~/.omp/.
+	const canonical = fromHome.replace(/^\.omp\/profiles\/[^/]+\//, ".omp/");
+	if (HOME_SECRET_DIRS.some((dir) => canonical === dir || canonical.startsWith(`${dir}/`))) return `~/${fromHome}`;
+	if (HOME_SECRET_FILES.some((file) => file.test(canonical))) return `~/${fromHome}`;
 	return undefined;
 }
 

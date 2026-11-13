@@ -3,9 +3,9 @@
 import { type ChildProcessByStdio, spawn } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import type { Readable } from "node:stream";
-import { applyHelperEvent, HELPER_ENV, HELPER_TIMEOUT_MS, HELPER_TOOLS, type HelperState, helperExitError, newHelperState, parseEventLine } from "./better.ts";
+import { applyHelperEvent, HELPER_ENV, HELPER_TIMEOUT_MS, HELPER_TOOLS, type HelperState, helperExitError, newHelperState, parseEventLine, rejectedCacheFlag } from "./better.ts";
 import { type CacheUsage, helperCacheArgs, PINNED_SUFFIX, PREFIX_ENV, type RequestHead, serializeHead } from "./cache.ts";
 
 export class Cancelled extends Error {}
@@ -13,6 +13,11 @@ export class Cancelled extends Error {}
 const TEMP_PREFIX = "omp-better-";
 const STDERR_LIMIT = 8192;
 const KILL_GRACE_MS = 3000;
+const GUARD_MARKER = "guard-ready";
+/** Set in the helper's environment to the pid of the omp that started it. */
+export const PARENT_ENV = "OMP_BETTER_PARENT_PID";
+/** How often the helper checks that the omp that started it is still there. */
+export const PARENT_POLL_MS = 2000;
 // The helper's own terminal id would overwrite the chat's /continue breadcrumb with the temp session, which is
 // deleted afterwards; without these (and without a TTY) omp has no terminal id to record.
 const TERMINAL_ID_ENV = ["ZELLIJ_PANE_ID", "ZELLIJ_SESSION_NAME", "TMUX_PANE", "CMUX_SURFACE_ID", "KITTY_WINDOW_ID", "WEZTERM_PANE", "TERM_SESSION_ID", "WT_SESSION"];
@@ -47,6 +52,8 @@ export interface HelperResult {
 	usage?: CacheUsage;
 	/** Whether the helper swapped the chat's request head into its requests. */
 	pinned: boolean;
+	/** The stderr line with which omp refused the cache flags; the run was then repeated without reuse. */
+	cacheFlagsRejected?: string;
 }
 
 /** The omp running this extension: a compiled omp is its own executable; from source it is bun plus the CLI script. */
@@ -103,6 +110,56 @@ export function sweepStaleTempDirs(root = tmpdir(), agentDir?: string): void {
 	});
 }
 
+export interface ParentProbe {
+	ppid: () => number;
+	kill: (pid: number, signal: 0) => void;
+}
+
+const liveProbe: ParentProbe = { ppid: () => process.ppid, kill: (pid, signal) => process.kill(pid, signal) };
+
+/**
+ * Whether the omp that started the helper is gone. When it dies the helper is adopted by another process, so
+ * its parent pid changes: a later process that reuses the old pid can't become its parent again. The parent's
+ * pid is checked too, for an omp that started the helper through another process. EPERM counts as gone: the
+ * parent runs as the same user, so a pid owned by someone else is a different process.
+ */
+export function parentGone(parentPid: number, startPpid: number, probe: ParentProbe = liveProbe): boolean {
+	if (probe.ppid() !== startPpid) return true;
+	try {
+		probe.kill(parentPid, 0);
+		return false;
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		return code === "ESRCH" || code === "EPERM";
+	}
+}
+
+/** Calls `onGone` once the parent is gone; checks every `intervalMs` on a timer that never keeps the process alive. Returns a stop function. */
+export function watchParent(options: { parentPid: number; onGone: () => void; probe?: ParentProbe; intervalMs?: number }): () => void {
+	const probe = options.probe ?? liveProbe;
+	const startPpid = probe.ppid();
+	const timer = setInterval(() => {
+		if (!parentGone(options.parentPid, startPpid, probe)) return;
+		clearInterval(timer);
+		options.onGone();
+	}, options.intervalMs ?? PARENT_POLL_MS);
+	timer.unref?.();
+	return () => clearInterval(timer);
+}
+
+/** The helper's temp folder, from its guard marker path, if it is one askHelper made for `parentPid` directly in `root`. */
+export function helperTempDir(marker: string, parentPid: number, root = tmpdir()): string | undefined {
+	const dir = dirname(resolve(marker));
+	if (basename(marker) !== GUARD_MARKER || dirname(dir) !== resolve(root) || !basename(dir).startsWith(`${TEMP_PREFIX}${parentPid}-`)) return undefined;
+	return dir;
+}
+
+/** Removes a temp folder and the session markers omp keeps for sessions in it. */
+export function removeTempDir(dir: string, agentDir: string | undefined): void {
+	rmSync(dir, { recursive: true, force: true });
+	removeSessionMarkers(agentDir, (path) => path.startsWith(`${dir}/`));
+}
+
 /** `--profile <name>` from omp's own arguments, so the helper uses the same auth, settings and sessions. */
 export function profileArgs(argv: string[]): string[] {
 	for (let i = 0; i < argv.length; i++) {
@@ -136,17 +193,32 @@ export function helperArgs(options: { sourceCopy?: string; sessionDir: string; e
 	];
 }
 
-/** Runs the helper and resolves with its last reply. Rejects with Cancelled when the signal aborts. */
-export function askHelper(options: HelperOptions): Promise<HelperResult> {
+/** Thrown by one helper run when omp refused the cache flags before any reply. */
+class CacheFlagsRejected extends Error {}
+
+/**
+ * Runs the helper and resolves with its last reply. Rejects with Cancelled when the signal aborts. If omp
+ * refuses the cache flags (an omp that doesn't know them), the run is repeated once without cache reuse.
+ */
+export async function askHelper(options: HelperOptions): Promise<HelperResult> {
+	try {
+		return await runHelper(options);
+	} catch (error) {
+		if (!(error instanceof CacheFlagsRejected)) throw error;
+		if (options.signal.aborted) throw new Cancelled("cancelled");
+		const result = await runHelper({ ...options, head: undefined, chatSessionId: undefined });
+		return { ...result, cacheFlagsRejected: error.message };
+	}
+}
+
+function runHelper(options: HelperOptions): Promise<HelperResult> {
 	const timeoutMs = options.timeoutMs ?? HELPER_TIMEOUT_MS;
 	const temp = mkdtempSync(join(tmpdir(), `${TEMP_PREFIX}${process.pid}-`));
-	const cleanUp = () => {
-		rmSync(temp, { recursive: true, force: true });
-		removeSessionMarkers(options.agentDir, (path) => path.startsWith(`${temp}/`));
-	};
+	const cleanUp = () => removeTempDir(temp, options.agentDir);
 	let child: ChildProcessByStdio<null, Readable, Readable>;
-	const marker = join(temp, "guard-ready");
+	const marker = join(temp, GUARD_MARKER);
 	const prefix = join(temp, "prefix.json");
+	const cacheArgs = helperCacheArgs(options.head, options.chatSessionId);
 	try {
 		let sourceCopy: string | undefined;
 		if (options.sessionFile) {
@@ -154,7 +226,7 @@ export function askHelper(options: HelperOptions): Promise<HelperResult> {
 			copySession(options.sessionFile, sourceCopy);
 			mkdirSync(join(temp, "sessions"));
 		}
-		const env: NodeJS.ProcessEnv = { ...process.env, [HELPER_ENV]: marker, PI_NO_TITLE: "1" };
+		const env: NodeJS.ProcessEnv = { ...process.env, [HELPER_ENV]: marker, [PARENT_ENV]: String(process.pid), PI_NO_TITLE: "1" };
 		for (const key of TERMINAL_ID_ENV) delete env[key];
 		delete env[PREFIX_ENV];
 		// The chat's system prompt and tool list: private to this folder (0700), and removed with it.
@@ -163,7 +235,6 @@ export function askHelper(options: HelperOptions): Promise<HelperResult> {
 			writeFileSync(prefix, serializeHead(options.head), { mode: 0o600 });
 		}
 		const [command, ...prefixArgs] = options.command ?? ompCommand();
-		const cacheArgs = helperCacheArgs(options.head, options.chatSessionId);
 		const args = helperArgs({ sourceCopy, sessionDir: join(temp, "sessions"), extensionPath: options.extensionPath, modelArgs: options.modelArgs, task: options.task, profile: profileArgs(options.argv ?? process.argv), cacheArgs });
 		child = spawn(command, [...prefixArgs, ...args], { cwd: options.cwd, stdio: ["ignore", "pipe", "pipe"], env });
 	} catch (error) {
@@ -246,6 +317,9 @@ export function askHelper(options: HelperOptions): Promise<HelperResult> {
 		if (guardMissing) return settle(new Error(`The helper's read-only guard didn't load, so it was stopped before it could act. ${helperExitError(code, exitSignal, stderr)}`));
 		if (timedOut) return settle(new Error(`The helper timed out after ${Math.round(timeoutMs / 60_000)} minutes; try a narrower prompt`));
 		if (state.modelError) return settle(new Error(`The helper's model call failed: ${state.modelError}`));
+		// An omp that doesn't know the cache flags exits before any reply; every other failure is reported as is.
+		const rejected = cacheArgs.length > 0 && code !== 0 && !state.reply.trim() && !state.usage ? rejectedCacheFlag(stderr) : undefined;
+		if (rejected) return settle(new CacheFlagsRejected(rejected));
 		if (code !== 0) return settle(new Error(helperExitError(code, exitSignal, stderr)));
 		if (!state.reply.trim()) return settle(new Error("The helper finished without replying; run /better again"));
 		settle();

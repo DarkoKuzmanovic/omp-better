@@ -6,6 +6,7 @@ import {
 	applyHelperEvent,
 	buildHelperTask,
 	credentialInResult,
+	ENV_TEMPLATES,
 	HELPER_TOOLS,
 	helperExitError,
 	helperModelArgs,
@@ -16,6 +17,7 @@ import {
 	parseMarkedPrompt,
 	pathRefusal,
 	progressLines,
+	rejectedCacheFlag,
 	replyProgress,
 	withSecretExcludes,
 } from "../better.ts";
@@ -93,6 +95,29 @@ describe("helperExitError", () => {
 
 	test("quotes the last three stderr lines", () => {
 		expect(helperExitError(1, null, "a\nb\nc\nError: unknown model\n")).toBe("The helper exited with code 1: b c Error: unknown model");
+	});
+});
+
+describe("rejectedCacheFlag", () => {
+	test("finds omp 18.20.0's unknown-flag line for either cache flag", () => {
+		// omp 18.20.0's real output for an unknown flag, with the flag name swapped in.
+		const real = (flag: string) => `Error: unknown flag: ${flag}\nRun \`omp --help\` for available flags.\n`;
+		expect(rejectedCacheFlag(real("--prompt-cache-key"))).toBe("Error: unknown flag: --prompt-cache-key");
+		expect(rejectedCacheFlag(real("--provider-session-id"))).toBe("Error: unknown flag: --provider-session-id");
+		expect(rejectedCacheFlag(`boot\n${real("--prompt-cache-key")}`)).toBe("Error: unknown flag: --prompt-cache-key");
+		expect(rejectedCacheFlag("error: unrecognized option '--prompt-cache-key=abc'")).toBe("error: unrecognized option '--prompt-cache-key=abc'");
+		expect(rejectedCacheFlag("Invalid argument for --provider-session-id")).toBe("Invalid argument for --provider-session-id");
+	});
+
+	test("ignores other flags and other failures", () => {
+		expect(rejectedCacheFlag("Error: unknown flag: --definitely-not-a-flag\n")).toBeUndefined();
+		expect(rejectedCacheFlag("Error: unknown flag: --prompt-cache-keys\n")).toBeUndefined();
+		expect(rejectedCacheFlag("Error: unknown flag: --prompt-cache-key-v2\n")).toBeUndefined();
+		expect(rejectedCacheFlag("Error: Model not found: test/model\n")).toBeUndefined();
+		// Both conditions on one line: an unknown flag elsewhere and the cache key in another line don't add up.
+		expect(rejectedCacheFlag("Error: unknown flag: --foo\nusing --prompt-cache-key abc\n")).toBeUndefined();
+		expect(rejectedCacheFlag("401 invalid x-api-key while sending --prompt-cache-key\n")).toBeUndefined();
+		expect(rejectedCacheFlag("")).toBeUndefined();
 	});
 });
 
@@ -196,6 +221,28 @@ describe("pathRefusal", () => {
 		}
 	});
 
+	test("allows exactly the four .env templates, in every form a path takes", () => {
+		expect(ENV_TEMPLATES).toEqual([".env.example", ".env.sample", ".env.template", ".env.dist"]);
+		for (const name of ENV_TEMPLATES) {
+			for (const path of [name, `config/${name}`, `~/app/${name}`, `${name}:1-20`, `src;${name}`, ` ${name} ;src`, `file:///work/repo/${name}`, `backup.zip:app/${name}`, `https://example.com/${name}`]) {
+				expect(pathRefusal(path, scope)).toBeUndefined();
+			}
+			expect(helperToolBlock("read", { path: name }, scope)).toBeUndefined();
+			expect(helperToolBlock("lsp", { action: "hover", file: name }, scope)).toBeUndefined();
+		}
+	});
+
+	test("refuses every other name starting with .env, in every form a path takes", () => {
+		for (const name of [".env", ".env.local", ".env.production", ".envrc", ".env.example.bak", ".env.examples", ".env.sample~", ".env.dist.local", ".env-example", ".env.EXAMPLE"]) {
+			for (const path of [name, `config/${name}`, `${name}:1-20`, `src;${name}`, `src;.env.example;${name}`, `file:///work/repo/${name}`, `backup.zip:app/${name}`, `https://example.com/${name}`]) {
+				expect(pathRefusal(path, scope)).toMatch(/looks like a credential file/);
+			}
+		}
+		// A template name doesn't make a directory under it safe, nor a .env inside one.
+		expect(pathRefusal(".env.example/../.env", scope)).toMatch(/credential/);
+		expect(pathRefusal("config/.env.example/.env.local", scope)).toMatch(/credential/);
+	});
+
 	test("follows symlinks to credential files", () => {
 		const dir = mkdtempSync(join(tmpdir(), "omp-better-test-"));
 		try {
@@ -207,9 +254,32 @@ describe("pathRefusal", () => {
 			rmSync(dir, { recursive: true, force: true });
 		}
 	});
+
+	test("a template name that links to a credential file is refused; a real template file is allowed", () => {
+		const dir = mkdtempSync(join(tmpdir(), "omp-better-test-"));
+		try {
+			const fakeHome = join(dir, "home");
+			mkdirSync(join(fakeHome, ".aws"), { recursive: true });
+			writeFileSync(join(fakeHome, ".aws", "credentials"), "[default]\naws_secret_access_key=fake\n");
+			writeFileSync(join(dir, ".env"), "TOKEN=fake\n");
+			writeFileSync(join(dir, ".env.template"), "TOKEN=\n");
+			symlinkSync(join(dir, ".env"), join(dir, ".env.example"));
+			symlinkSync(join(fakeHome, ".aws", "credentials"), join(dir, ".env.sample"));
+			symlinkSync(join(dir, ".env.template"), join(dir, ".env.dist"));
+			const local = { cwd: dir, home: fakeHome };
+			expect(pathRefusal(".env.example", local)).toMatch(/^\.env looks like a credential file/);
+			expect(pathRefusal(`file://${dir}/.env.example`, local)).toMatch(/^\.env looks like/);
+			expect(pathRefusal(".env.example:1-3", local)).toMatch(/^\.env looks like/);
+			expect(pathRefusal("src;.env.sample", local)).toMatch(/^~\/\.aws\/credentials looks like a credential file/);
+			expect(pathRefusal(".env.template", local)).toBeUndefined();
+			expect(pathRefusal(".env.dist", local)).toBeUndefined();
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
 });
 
-test("grep gets the credential exclusions added to its path", () => {
+test("grep gets the credential exclusions added to its path, the .env templates still among them", () => {
 	expect(withSecretExcludes(undefined).startsWith(".;!**/.env*;")).toBe(true);
 	expect(withSecretExcludes("src; tests").startsWith("src; tests;!**/.env*;")).toBe(true);
 	expect(withSecretExcludes("src")).toContain("!**/.ssh");
@@ -239,6 +309,25 @@ describe("credentialInResult", () => {
 		const grep = "# /work/repo/src/\n## app.ts#089A\n*1:const token = process.env.SECRET_TOKEN; // from .env\n 2|// see .env.example";
 		expect(credentialInResult(grep, scope)).toBeUndefined();
 		expect(credentialInResult("No matches found", scope)).toBeUndefined();
+	});
+
+	test("a result that names only .env templates passes; one that also names a real .env is withheld", () => {
+		const templates = "# /work/repo/\n## .env.example#5A99\n*1:SECRET_TOKEN=\n\n## config/\n### .env.dist#1B2C\n*2:DB_URL=";
+		expect(credentialInResult(templates, scope)).toBeUndefined();
+		expect(credentialInResult(".env.sample  0.72  1 lines judged\n  .env.sample:1  0.72  TOKEN=\n", scope)).toBeUndefined();
+		expect(credentialInResult(`${templates}\n\n## .env.local#77AA\n*1:SECRET_TOKEN=x`, scope)).toBe(".env.local");
+		expect(credentialInResult("[/work/repo/.env#5A99]\n1:SECRET_TOKEN=x", scope)).toBe(".env");
+	});
+
+	test("a template name that links to a real .env is withheld", () => {
+		const dir = mkdtempSync(join(tmpdir(), "omp-better-test-"));
+		try {
+			writeFileSync(join(dir, ".env"), "TOKEN=fake\n");
+			symlinkSync(join(dir, ".env"), join(dir, ".env.example"));
+			expect(credentialInResult(".env.example  0.72  1 lines judged\n  .env.example:1  0.72  TOKEN=fake\n", { cwd: dir, home })).toBe(".env");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });
 

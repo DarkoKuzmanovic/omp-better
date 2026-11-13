@@ -24,9 +24,13 @@ export const READ_SCHEMES = ["http", "https", "file", "skill", "omp", "rule", "a
 // Under the home directory: whole trees, then single files (prefix match on the path relative to home).
 const HOME_SECRET_DIRS = [".ssh", ".aws", ".gnupg", ".password-store", ".docker", ".kube", ".omp/agent/secrets"];
 const HOME_SECRET_FILES = [/^\.omp\/agent\/agent\.db/, /^\.omp\/agent\/models\.ya?ml$/, /^\.omp\/agent\/mcp\.json$/, /^\.config\/.+\/credentials[^/]*$/];
-// Anywhere: any path component named like these.
-const SECRET_NAMES = [/^\.env/, /^auth[^/]*\.json$/i, /^\.netrc$/, /^\.git-credentials$/, /^\.pgpass$/, /^\.npmrc$/, /^\.pypirc$/, /^id_(rsa|dsa|ecdsa|ed25519)/];
-/** Appended to grep's path so a directory search skips files the guard would refuse to read. */
+// Anywhere: any path component named like these. `.env*` spares exactly the four usual template names.
+export const ENV_TEMPLATES = [".env.example", ".env.sample", ".env.template", ".env.dist"];
+const SECRET_NAMES = [/^\.env(?!\.(example|sample|template|dist)$)/, /^auth[^/]*\.json$/i, /^\.netrc$/, /^\.git-credentials$/, /^\.pgpass$/, /^\.npmrc$/, /^\.pypirc$/, /^id_(rsa|dsa|ecdsa|ed25519)/];
+/**
+ * Appended to grep's path so a directory search skips files the guard would refuse to read. A glob exclusion
+ * can't let a name back in, so the `.env*` one skips the `.env` templates too; `read` opens them.
+ */
 export const SECRET_EXCLUDES = ["!**/.env*", "!**/auth*.json", "!**/.netrc", "!**/.git-credentials", "!**/.pgpass", "!**/.npmrc", "!**/.pypirc", "!**/id_rsa*", "!**/id_dsa*", "!**/id_ecdsa*", "!**/id_ed25519*", "!**/.ssh", "!**/.aws", "!**/.gnupg", "!**/agent.db*", "!**/credentials*"];
 
 const returnSection = `## Return
@@ -75,6 +79,21 @@ export function helperExitError(code: number | null, signal: string | null, stde
 	const how = code === null ? `was stopped by ${signal ?? "an unknown signal"}` : `exited with code ${code}`;
 	const tail = stderr.trim().split("\n").slice(-3).join(" ");
 	return tail ? `The helper ${how}: ${tail}` : `The helper ${how} without printing an error`;
+}
+
+/** The cache flags omp may not know: they work on omp 18.20.0 but its --help doesn't list them. */
+export const CACHE_FLAGS = ["--prompt-cache-key", "--provider-session-id"];
+
+/**
+ * The stderr line in which omp refused one of the cache flags, or undefined. omp 18.20.0 prints
+ * "Error: unknown flag: --name" (exit code 2); other wordings of an unknown or invalid option count when the
+ * line names one of the two flags.
+ */
+export function rejectedCacheFlag(stderr: string): string | undefined {
+	return stderr
+		.split("\n")
+		.map((line) => line.trim())
+		.find((line) => /\b(unknown|unrecogni[sz]ed|invalid|unexpected|unsupported)\s+(flag|option|argument)s?\b/i.test(line) && CACHE_FLAGS.some((flag) => new RegExp(`${flag}(?![\\w-])`).test(line)));
 }
 
 /**

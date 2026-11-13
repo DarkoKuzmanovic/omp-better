@@ -3,10 +3,28 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.2.1] - 2026-11-13
+## [0.3.0] - 2026-11-13
+
+### Added
+
+- The helper exits on its own, within about 3 seconds, once the omp that started it is gone. omp passes
+  its pid in `OMP_BETTER_PARENT_PID`; the helper checks every 2 seconds (an unref'd timer) whether it was
+  adopted by another process or that pid is gone, then exits with code 1 and removes its temp folder and
+  session marker. In 0.2.0 a helper that wasn't writing output, for example one waiting on a slow tool
+  call, kept running after a SIGKILL of its omp until its 20-minute limit.
+- If omp refuses `--prompt-cache-key` or `--provider-session-id` (unknown or invalid option on stderr,
+  exit before any reply), the helper runs once more without cache reuse, and the `better` entry's
+  `cache.skipped` names the refusal. Other failures are not retried; Anthropic runs never pass the flags.
 
 ### Changed
 
+- A running `/better` also stops on `session_branch` (a branch or fork from an earlier entry, `/btw`
+  promotion) and `session_tree` (`/tree`, `/branch`), not only on `session_switch` (`/new`, `/resume`,
+  `/fork`) and `session_shutdown`: its copy of the conversation is stale then. Compaction doesn't stop it.
+- The credential guard allows `.env.example`, `.env.sample`, `.env.template` and `.env.dist` by exact
+  name; every other `.env*` name is still refused, and so is a template name that resolves through a
+  symlink to a refused file. `grep`'s `!**/.env*` exclusion stays, so a directory search skips the
+  templates; `read` opens them.
 - README checked against the 0.2.0 code and shortened. Corrections:
   - Cache reuse is gated on the model's API (`anthropic-messages`, `openai-codex-responses`), not the
     provider name; it was measured on `anthropic` and `openai-codex` only.

@@ -1,15 +1,16 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, vi } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HELPER_TOOLS, parseMarkedPrompt } from "../better.ts";
 import { parseHead, type RequestHead } from "../cache.ts";
-import { askHelper, Cancelled, helperArgs, profileArgs, sweepStaleTempDirs } from "../spawn.ts";
+import { askHelper, Cancelled, helperArgs, helperTempDir, PARENT_POLL_MS, type ParentProbe, parentGone, profileArgs, sweepStaleTempDirs, watchParent } from "../spawn.ts";
 
 const fake = ["bun", new URL("./fake-omp.ts", import.meta.url).pathname];
 const fixtures = new URL("./fixtures/", import.meta.url).pathname;
 const ours = () => readdirSync(tmpdir()).filter((name) => name.startsWith(`omp-better-${process.pid}-`));
-const FAKE_KEYS = ["FAKE_OMP_FIXTURE", "FAKE_OMP_GUARD", "FAKE_OMP_EXIT", "FAKE_OMP_STDERR", "FAKE_OMP_SIGNAL", "FAKE_OMP_HANG", "FAKE_OMP_REPORT", "FAKE_OMP_AGENT_DIR", "FAKE_OMP_PIN"];
+const FAKE_KEYS = ["FAKE_OMP_FIXTURE", "FAKE_OMP_GUARD", "FAKE_OMP_EXIT", "FAKE_OMP_STDERR", "FAKE_OMP_SIGNAL", "FAKE_OMP_HANG", "FAKE_OMP_REPORT", "FAKE_OMP_AGENT_DIR", "FAKE_OMP_PIN", "FAKE_OMP_CALLS", "FAKE_OMP_REJECT_CACHE_FLAGS"];
 const codexHead: RequestHead = {
 	model: { provider: "openai-codex", id: "gpt-x", api: "openai-codex-responses" },
 	fields: { instructions: "SYSTEM", tools: [{ type: "function", name: "bash" }], prompt_cache_key: "chat-key", developer: [] },
@@ -157,6 +158,15 @@ describe("askHelper", () => {
 		}
 	});
 
+	test("tells the helper which omp started it", async () => {
+		await withDir(async (dir) => {
+			const report = join(dir, "report.json");
+			setFake({ FAKE_OMP_FIXTURE: join(fixtures, "helper-run.jsonl"), FAKE_OMP_REPORT: report });
+			await run();
+			expect(JSON.parse(readFileSync(report, "utf8")).parentPid).toBe(String(process.pid));
+		});
+	});
+
 	test("stops a helper whose guard didn't load", async () => {
 		setFake({ FAKE_OMP_FIXTURE: join(fixtures, "helper-run.jsonl"), FAKE_OMP_GUARD: "missing", FAKE_OMP_HANG: "1" });
 		await expect(run()).rejects.toThrow(/read-only guard didn't load, so it was stopped before it could act/);
@@ -217,6 +227,138 @@ describe("askHelper", () => {
 
 	test("a command that can't start is reported", async () => {
 		await expect(askHelper({ cwd: tmpdir(), modelArgs: [], task: "T", signal: new AbortController().signal, extensionPath: "/e.ts", command: ["/nonexistent/omp-binary"] })).rejects.toThrow(/Couldn't start omp for the helper/);
+	});
+});
+
+describe("an omp that rejects the cache flags", () => {
+	const calls = (file: string) => readFileSync(file, "utf8").trim().split("\n").map((line) => JSON.parse(line) as { args: string[]; prefix?: string });
+
+	test("gets the run again without the flags and without the chat's head", async () => {
+		await withDir(async (dir) => {
+			const log = join(dir, "calls.jsonl");
+			setFake({ FAKE_OMP_FIXTURE: join(fixtures, "helper-run.jsonl"), FAKE_OMP_REJECT_CACHE_FLAGS: "1", FAKE_OMP_CALLS: log, FAKE_OMP_PIN: "1" });
+			const result = await run(undefined, { head: codexHead, chatSessionId: "chat-id" });
+			expect(parseMarkedPrompt(result.reply)).toContain("src/cli.ts");
+			expect(result.cacheFlagsRejected).toBe("Error: unknown flag: --prompt-cache-key");
+			expect(result.pinned).toBe(false);
+			const [first, retry, ...more] = calls(log);
+			expect(more).toEqual([]);
+			expect(first.args).toContain("--prompt-cache-key");
+			expect(first.prefix).toBeDefined();
+			expect(retry.args).not.toContain("--prompt-cache-key");
+			expect(retry.args).not.toContain("--provider-session-id");
+			expect(retry.prefix).toBeUndefined();
+		});
+	});
+
+	test("surfaces a rejection on the retry instead of trying again", async () => {
+		await withDir(async (dir) => {
+			const log = join(dir, "calls.jsonl");
+			setFake({ FAKE_OMP_REJECT_CACHE_FLAGS: "always", FAKE_OMP_CALLS: log });
+			await expect(run(undefined, { head: codexHead, chatSessionId: "chat-id" })).rejects.toThrow("The helper exited with code 2: Error: unknown flag: --prompt-cache-key Run `omp --help` for available flags.");
+			expect(calls(log)).toHaveLength(2);
+		});
+	});
+
+	test("any other failure is not retried, even with the cache flags passed", async () => {
+		await withDir(async (dir) => {
+			const log = join(dir, "calls.jsonl");
+			setFake({ FAKE_OMP_EXIT: "1", FAKE_OMP_STDERR: "Error: Model not found: test/model\n", FAKE_OMP_CALLS: log });
+			await expect(run(undefined, { head: codexHead, chatSessionId: "chat-id" })).rejects.toThrow("The helper exited with code 1: Error: Model not found: test/model");
+			expect(calls(log)).toHaveLength(1);
+		});
+	});
+
+	test("a run that already replied is not retried", async () => {
+		await withDir(async (dir) => {
+			const log = join(dir, "calls.jsonl");
+			setFake({ FAKE_OMP_FIXTURE: join(fixtures, "helper-run.jsonl"), FAKE_OMP_EXIT: "2", FAKE_OMP_STDERR: "Error: unknown flag: --prompt-cache-key\n", FAKE_OMP_CALLS: log });
+			await expect(run(undefined, { head: codexHead, chatSessionId: "chat-id" })).rejects.toThrow(/exited with code 2/);
+			expect(calls(log)).toHaveLength(1);
+		});
+	});
+
+	test("an Anthropic run passes no cache flags, so it is never retried", async () => {
+		await withDir(async (dir) => {
+			const log = join(dir, "calls.jsonl");
+			setFake({ FAKE_OMP_REJECT_CACHE_FLAGS: "always", FAKE_OMP_CALLS: log });
+			const head: RequestHead = { model: { provider: "anthropic", id: "c", api: "anthropic-messages" }, fields: { system: [{ type: "text", text: "S" }], tools: [{ name: "read" }] } };
+			await expect(run(undefined, { head, chatSessionId: "chat-id" })).rejects.toThrow(/exited with code 2/);
+			expect(calls(log)).toHaveLength(1);
+		});
+	});
+});
+
+describe("watching the omp that started the helper", () => {
+	const probe = (ppid: () => number, kill: ParentProbe["kill"] = () => {}): ParentProbe => ({ ppid, kill });
+	const failing = (code: string) => () => {
+		throw Object.assign(new Error(code), { code });
+	};
+
+	test("the parent is there while the helper keeps its parent and the pid answers", () => {
+		expect(parentGone(100, 100, probe(() => 100))).toBe(false);
+		// An omp that started the helper through another process: that process is the helper's parent.
+		expect(parentGone(100, 150, probe(() => 150))).toBe(false);
+	});
+
+	test("the parent is gone once the helper was adopted, even if a new process took the old pid", () => {
+		expect(parentGone(100, 100, probe(() => 1))).toBe(true);
+		expect(parentGone(100, 100, probe(() => 1075))).toBe(true);
+	});
+
+	test("the parent is gone when its pid is free or belongs to another user; other errors don't count", () => {
+		expect(parentGone(100, 150, probe(() => 150, failing("ESRCH")))).toBe(true);
+		expect(parentGone(100, 150, probe(() => 150, failing("EPERM")))).toBe(true);
+		expect(parentGone(100, 150, probe(() => 150, failing("EINVAL")))).toBe(false);
+	});
+
+	test("watchParent checks on its interval and calls onGone once, after the parent goes", () => {
+		vi.useFakeTimers();
+		try {
+			let ppid = 100;
+			let gone = 0;
+			watchParent({ parentPid: 100, onGone: () => gone++, probe: probe(() => ppid) });
+			vi.advanceTimersByTime(PARENT_POLL_MS * 3);
+			expect(gone).toBe(0);
+			ppid = 1;
+			vi.advanceTimersByTime(PARENT_POLL_MS - 1);
+			expect(gone).toBe(0);
+			vi.advanceTimersByTime(PARENT_POLL_MS * 3);
+			expect(gone).toBe(1);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test("stopping the watch ends the checks", () => {
+		vi.useFakeTimers();
+		try {
+			let ppid = 100;
+			let gone = 0;
+			const stop = watchParent({ parentPid: 100, onGone: () => gone++, probe: probe(() => ppid) });
+			stop();
+			ppid = 1;
+			vi.advanceTimersByTime(PARENT_POLL_MS * 3);
+			expect(gone).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test("the watch never keeps a process alive on its own", () => {
+		// A real process: only its exit shows that the timer is unref'd. A ref'd one would run into the timeout.
+		const spawnUrl = new URL("../spawn.ts", import.meta.url).pathname;
+		const script = `import { watchParent } from ${JSON.stringify(spawnUrl)}; watchParent({ parentPid: process.ppid, onGone: () => process.exit(3) });`;
+		expect(spawnSync("bun", ["-e", script], { timeout: 10_000 }).status).toBe(0);
+	});
+
+	test("helperTempDir accepts only a folder askHelper made for that parent", () => {
+		const root = "/tmp";
+		expect(helperTempDir("/tmp/omp-better-123-AbC/guard-ready", 123, root)).toBe("/tmp/omp-better-123-AbC");
+		expect(helperTempDir("/tmp/omp-better-1234-AbC/guard-ready", 123, root)).toBeUndefined();
+		expect(helperTempDir("/tmp/omp-better-123-AbC/other", 123, root)).toBeUndefined();
+		expect(helperTempDir("/tmp/x/omp-better-123-AbC/guard-ready", 123, root)).toBeUndefined();
+		expect(helperTempDir("/home/me/omp-better-123-AbC/guard-ready", 123, root)).toBeUndefined();
 	});
 });
 

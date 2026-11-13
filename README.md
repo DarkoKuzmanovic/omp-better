@@ -33,7 +33,7 @@ omp loads a folder in `extensions/` through its `index.ts`; there is nothing to 
 | `/better` | Deepens the task in progress in this chat, including feedback you gave on earlier work. Needs a saved session, which omp writes once the chat has a message. |
 | `/better-cancel` | Stops a running helper. Nothing is sent. |
 
-Only one `/better` runs at a time. A run stops on `/better-cancel`, after 20 minutes, when the session switches (`/resume` or `/fork`, for example) and when omp shuts down. While it runs you can keep chatting, and a two-line widget shows progress:
+Only one `/better` runs at a time. A run stops on `/better-cancel`, after 20 minutes, when omp shuts down, and when the conversation it copied stops being the active one: on `/new`, `/resume`, `/fork`, a branch or fork from an earlier entry, and a move to another entry with `/tree` or `/branch`. Compaction doesn't stop it. This was checked live over RPC with `new_session`, `switch_session`, `fork` (with and without an entry), `branch` and `navigate_tree`, the commands omp's docs give for those. While it runs you can keep chatting, and a two-line widget shows progress:
 
 ```
 /better · Picking the methods and tools (3 of 4) · 41s · /better-cancel stops it
@@ -59,10 +59,10 @@ The helper is a separate `omp` process that loads this extension as a guard. The
 - **lsp read actions only.** `diagnostics`, `definition`, `references`, `hover`, `symbols`, `type_definition`, `implementation`, `status` and `capabilities`. Other actions (`rename`, `code_actions`, raw `request`, …) and anything with `apply: true` are refused.
 - **Fails closed.** The guard writes a marker file when it loads. If the helper's session starts and the marker is missing, the helper is stopped at once and `/better` fails. The helper is never given `--auto-approve`.
 - **Credential paths.** The `path` argument of `read`, `grep`, `glob`, `find` and `ast_grep` and the `file` argument of `lsp` are checked as given and again after resolving symlinks, including `;`-separated lists, `:selectors`, archive members and `file://` URLs. Refused:
-  - any path component named `.env*`, `auth*.json`, `.netrc`, `.git-credentials`, `.pgpass`, `.npmrc`, `.pypirc`, `id_rsa*`, `id_dsa*`, `id_ecdsa*` or `id_ed25519*`;
+  - any path component named `.env*`, `auth*.json`, `.netrc`, `.git-credentials`, `.pgpass`, `.npmrc`, `.pypirc`, `id_rsa*`, `id_dsa*`, `id_ecdsa*` or `id_ed25519*`. Four `.env` templates are allowed, by exact name: `.env.example`, `.env.sample`, `.env.template` and `.env.dist` (`.env.example.bak` or `.env.local` are not), unless they resolve to a refused file through a symlink;
   - under your home directory: `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.password-store`, `~/.docker`, `~/.kube`, `~/.omp/agent/secrets`, `~/.omp/agent/agent.db*`, `~/.omp/agent/models.yml`, `~/.omp/agent/mcp.json` and `~/.config/**/credentials*`. The same `~/.omp/agent/…` files under `~/.omp/profiles/<name>/agent/` are refused too;
   - URLs with a scheme other than `http(s)`, `file`, `skill`, `omp`, `rule`, `artifact`, `local`, `memory`, `history`, `agent`, `issue` and `pr`. That rules out `ssh://`, `vault://`, `proc://`, `mcp://` and `xd://`.
-- **Searches.** `grep` gets exclusions such as `!**/.env*` and `!**/.ssh` added to its path. If a `grep`, `find` or `ast_grep` result still names a credential file, the whole result is withheld from the model.
+- **Searches.** `grep` gets exclusions such as `!**/.env*` and `!**/.ssh` added to its path. An exclusion can't let a name back in, so a directory `grep` skips the `.env` templates too; `read` opens them. If a `grep`, `find` or `ast_grep` result still names a credential file, the whole result is withheld from the model; one that names only the templates is not.
 
 `bun test` covers these rules, with and without [prompt-cache reuse](#prompt-cache), and `tests/fixtures/guard-refusals.jsonl` is a captured omp 18.20.0 run under the guard in which `write`, `bash`, `eval`, `task` and `edit` calls were all refused. With reuse the model is shown the chat's tool list, `bash` and `edit` included, but the helper's `--tools` list and guard stay the same. In the author's live runs on Anthropic and OpenAI Codex, which this repo does not record, `bash` and `edit` calls then came back `Tool … not found` from omp, `write` was refused by the guard, and no file changed.
 
@@ -70,9 +70,9 @@ Not guaranteed:
 
 - **This is not a sandbox.** The allowed tools are trusted to be read-only. `read` fetches URLs over the network, `web_search` sends queries to a search provider, and `lsp` starts language servers, which can run project code (rust-analyzer runs `build.rs` and proc macros, for example).
 - **Everything the helper reads goes to the model provider**, as in any chat.
-- **The credential guard works on names and paths, not contents.** A key hard-coded in `config.ts` or `settings.json` is readable. The guard also blocks some harmless files, such as `.env.example` and `authors.json`.
+- **The credential guard works on names and paths, not contents.** A key hard-coded in `config.ts` or `settings.json` is readable, and so is a real secret someone put in `.env.example` or another allowed template. The guard also blocks some harmless files, such as `authors.json`.
 - **MCP servers are not switched off in the helper.** Only their tools are refused.
-- **A killed omp leaves its helper running.** After a SIGKILL of omp, the helper goes on until its own `--max-time 20m`.
+- **A killed omp's helper runs on for up to about 3 seconds.** The helper checks every 2 seconds whether the omp that started it is still there and exits if not, which ends its model request too; after a SIGKILL of that omp, the author's runs saw it gone in 0.4 to 2.7 s. Its temp folder goes with it, or with the next omp that loads the extension.
 
 ## How it works
 
@@ -83,8 +83,8 @@ omp --mode json -p [--profile <yours>] (--fork <copy> --session-dir <temp>/sessi
     --model <model> [--thinking <level>] <task>
 ```
 
-- The helper runs in the chat's working directory with `OMP_BETTER_HELPER` set, which makes `index.ts` act as the guard there. Its task is `helper.md`, then your prompt, then a request to end with the rewrite between `<improved-prompt>` and `</improved-prompt>` lines. With cache reuse, a line naming the tools that work follows `helper.md`.
-- Each run gets a private temp folder, deleted when the helper ends and when omp exits; if omp was killed, the next omp that loads the extension deletes it. With cache reuse it holds `prefix.json` (mode 0600), the head of the chat's last request, which `OMP_BETTER_PREFIX` points the helper at. On OpenAI Codex the bracketed flags also pass the chat's cache key and session id.
+- The helper runs in the chat's working directory with `OMP_BETTER_HELPER` set, which makes `index.ts` act as the guard there, and `OMP_BETTER_PARENT_PID`, the pid of the omp it watches. Its task is `helper.md`, then your prompt, then a request to end with the rewrite between `<improved-prompt>` and `</improved-prompt>` lines. With cache reuse, a line naming the tools that work follows `helper.md`.
+- Each run gets a private temp folder, deleted when the helper ends and when omp exits; if omp was killed, the helper deletes it as it exits, and the next omp that loads the extension deletes any that are left. With cache reuse it holds `prefix.json` (mode 0600), the head of the chat's last request, which `OMP_BETTER_PREFIX` points the helper at. On OpenAI Codex the bracketed flags also pass the chat's cache key and session id.
 - If the session is saved, its file is copied into that folder, cut at the last complete line, and the helper forks the copy. Your session file is only read. Nothing else is copied, so `artifact://` links from the chat may not resolve for the helper, and messages you send after starting `/better` don't reach it.
 
 ## Prompt cache
@@ -102,6 +102,7 @@ Each row is a probe ("Reply with ok2") sent as the helper's first request right 
 - **When it applies.** The chat's model must use omp's `anthropic-messages` or `openai-codex-responses` API (measured on the `anthropic` and `openai-codex` providers only), and omp must have sent a chat request since it started and since the last session or model switch. Otherwise the helper sends its own request, as in 0.1.1.
 - **When it misses.** Providers drop the cache after a while: Anthropic after 5 minutes or an hour, as omp asks; OpenAI Codex gives no promise, though 12 of 12 measured runs hit. A hit can be partial if the chat's requests differed from its session file, for example through another extension's `context` hook.
 - **Fewer tools.** The helper is offered only the tools the chat's request lists. It loses `ast_grep` and `lsp` when the chat has them only behind `xd://`; `OMP_BETTER_CACHE=off` brings them back.
+- **If omp refuses the cache flags.** omp 18.20.0 accepts `--prompt-cache-key` and `--provider-session-id` but its `--help` doesn't list them. If the helper exits before replying with an unknown or invalid option error naming one of them (omp prints `Error: unknown flag: --name`), `/better` runs it once more without reuse, and `cache.skipped` in the session entry gives the reason. Other failures are never retried.
 
 ## Differences from pi-better
 

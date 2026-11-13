@@ -19,7 +19,7 @@ import {
 	withSecretExcludes,
 } from "./better.ts";
 import { type CachePlan, cacheOutcome, cachePlan, captureHead, PINNED_SUFFIX, PREFIX_ENV, parseHead, pinRequest, type RequestHead } from "./cache.ts";
-import { askHelper, Cancelled, sweepStaleTempDirs } from "./spawn.ts";
+import { askHelper, Cancelled, helperTempDir, PARENT_ENV, removeTempDir, sweepStaleTempDirs, watchParent } from "./spawn.ts";
 
 const WIDGET = "better";
 const ENTRY = "better";
@@ -50,8 +50,29 @@ function guardHelper(pi: ExtensionAPI, marker: string): void {
 		};
 	});
 	pinToChat(pi);
+	leaveWithParent(pi, marker);
 	// askHelper refuses to go on without this file, so a helper whose guard failed to load never acts.
 	writeFileSync(marker, String(process.pid));
+}
+
+/**
+ * Inside the helper: exit once the omp that started it is gone (killed with SIGKILL, so it couldn't stop the
+ * helper itself), which also ends a model request in flight. The helper's temp folder goes along with it.
+ */
+function leaveWithParent(pi: ExtensionAPI, marker: string): void {
+	const parentPid = Number(process.env[PARENT_ENV]);
+	if (!Number.isInteger(parentPid) || parentPid <= 1) return;
+	const agentDir = typeof pi.pi?.getAgentDir === "function" ? pi.pi.getAgentDir() : undefined;
+	watchParent({
+		parentPid,
+		onGone: () => {
+			const temp = helperTempDir(marker, parentPid);
+			// Registered last, so it runs after omp's own exit handlers have written what they write.
+			if (temp) process.once("exit", () => removeTempDir(temp, agentDir));
+			process.stderr.write(`omp-better: the omp that started this helper (pid ${parentPid}) is gone; stopping.\n`);
+			process.exit(1);
+		},
+	});
 }
 
 /**
@@ -111,6 +132,7 @@ export default function (pi: ExtensionAPI) {
 		return undefined;
 	});
 
+	// The helper works on a copy of the conversation as it was; once another one is active, its rewrite is stale.
 	const stopRun = (_event: unknown, ctx: ExtensionContext) => {
 		// The next session has a cache key of its own.
 		lastRequest = undefined;
@@ -120,7 +142,12 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.setWidget(WIDGET, undefined);
 	};
 	pi.on("session_shutdown", stopRun);
+	// /new, /resume, /fork.
 	pi.on("session_switch", stopRun);
+	// A branch or fork from an earlier entry, and /btw promotion: a new session holding part of the conversation.
+	pi.on("session_branch", stopRun);
+	// /tree and /branch: the same session file, moved to another point of the conversation.
+	pi.on("session_tree", stopRun);
 
 	pi.registerCommand("better", {
 		description: "Deepen a prompt (or the task in progress) with a read-only helper in the background, then put the improved prompt in your input box",
@@ -183,8 +210,9 @@ export default function (pi: ExtensionAPI) {
 						},
 					});
 					if (run.signal.aborted) throw new Cancelled("cancelled");
-					const { reply, usage, pinned } = result;
-					const skipped = "skipped" in plan ? plan.skipped : pinned ? undefined : "the helper's request didn't match the chat's model or shape";
+					const { reply, usage, pinned, cacheFlagsRejected } = result;
+					const skipped =
+						"skipped" in plan ? plan.skipped : cacheFlagsRejected ? `omp rejected the cache flags (${cacheFlagsRejected}), so the helper ran again without reuse` : pinned ? undefined : "the helper's request didn't match the chat's model or shape";
 					const cache = { pinned, ...usage, ...(skipped ? { skipped } : {}) };
 					let improved: string;
 					try {

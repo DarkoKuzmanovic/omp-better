@@ -1,11 +1,18 @@
-// Stands in for `omp --mode json -p` in spawn.test.ts. FAKE_OMP_* variables pick what it does.
-import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
+// Stands in for `omp --mode json -p` in spawn.test.ts and index.test.ts. FAKE_OMP_* variables pick what it does.
+import { appendFileSync, existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const env = process.env;
 const args = process.argv.slice(2);
 const marker = env.OMP_BETTER_HELPER;
 const prefix = env.OMP_BETTER_PREFIX;
+// One line per start, for tests of a run that is repeated.
+if (env.FAKE_OMP_CALLS) appendFileSync(env.FAKE_OMP_CALLS, `${JSON.stringify({ args, prefix })}\n`);
+// Like an omp that doesn't know the cache flags ("always": also when they aren't passed). The text is what omp 18.20.0 prints for an unknown flag.
+if (env.FAKE_OMP_REJECT_CACHE_FLAGS && (env.FAKE_OMP_REJECT_CACHE_FLAGS === "always" || args.includes("--prompt-cache-key"))) {
+	process.stderr.write("Error: unknown flag: --prompt-cache-key\nRun `omp --help` for available flags.\n");
+	process.exit(2);
+}
 if (env.FAKE_OMP_REPORT) {
 	const fork = args.includes("--fork") ? args[args.indexOf("--fork") + 1] : undefined;
 	writeFileSync(
@@ -15,6 +22,7 @@ if (env.FAKE_OMP_REPORT) {
 			fork,
 			forkContent: fork && existsSync(fork) ? readFileSync(fork, "utf8") : undefined,
 			envKeys: Object.keys(env),
+			parentPid: env.OMP_BETTER_PARENT_PID,
 			pid: process.pid,
 			prefix,
 			prefixMode: prefix && existsSync(prefix) ? statSync(prefix).mode & 0o777 : undefined,

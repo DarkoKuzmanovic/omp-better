@@ -3,6 +3,21 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.1] - 2026-11-13
+
+### Changed
+
+- README checked against the 0.2.0 code and shortened. Corrections:
+  - Cache reuse is gated on the model's API (`anthropic-messages`, `openai-codex-responses`), not the
+    provider name; it was measured on `anthropic` and `openai-codex` only.
+  - The helper loses `ast_grep` and `lsp` on OpenAI Codex too, not only on Anthropic (the 0.2.0
+    entry below says Anthropic only), whenever the chat's request lists them only behind `xd://`.
+    `OMP_BETTER_CACHE=off` brings them back.
+  - Any `OMP_BETTER_CACHE` value other than `on` or `off` makes `/better` fail; setting
+    `OMP_BETTER_MODEL` or `OMP_BETTER_THINKING` turns reuse off even when it equals the chat's value.
+  - The README now states that the `--tools` list and the guard stay the same under reuse, and marks
+    the live-run tool outcomes and cache numbers as the author's measurements.
+
 ## [0.2.0] - 2026-11-13
 
 ### Added
